@@ -25,6 +25,13 @@ const ALLOW_NO_ORIGIN = process.env.STREAM_ALLOW_NO_ORIGIN === 'true';
 
 let wss = null;
 let heartbeat = null;
+// Supplies the analysis snapshot a client needs on (re)subscribe, and the feed
+// backlog. Injected by index.js so this module keeps no engine dependency.
+let snapshotProvider = null;
+
+function setSnapshotProvider(provider) {
+  snapshotProvider = provider;
+}
 
 function send(ws, msg) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
@@ -100,6 +107,14 @@ function handleSubscribe(ws, msg) {
 
   ws.subs.set(key, unsubscribe);
   send(ws, { t: 'sub_ok', symbol: symbol.symbol, interval });
+
+  // A fresh subscriber gets the FULL analysis state, then diffs from there.
+  // Starting straight on diffs would leave a client that joined mid-session
+  // with an empty chart until every zone happened to change.
+  if (snapshotProvider) {
+    const snapshot = snapshotProvider.analysis(symbol.symbol, interval);
+    if (snapshot) send(ws, snapshot);
+  }
 }
 
 function handleUnsubscribe(ws, msg) {
@@ -170,6 +185,20 @@ function attach(server) {
 
       if (msg.t === 'sub') handleSubscribe(ws, msg);
       else if (msg.t === 'unsub') handleUnsubscribe(ws, msg);
+      // The Signal Feed spans every symbol and timeframe, which is far more
+      // than MAX_SUBSCRIPTIONS_PER_CLIENT allows. It is a separate, non
+      // symbol-scoped channel precisely so it does not consume that budget:
+      // the server already computes these events for all pairs regardless of
+      // who is watching, so this is a pure fan-out with no upstream cost.
+      else if (msg.t === 'sub_signals') {
+        ws.signalsSubscribed = true;
+        send(ws, { t: 'signals_ok' });
+        if (snapshotProvider) {
+          for (const row of snapshotProvider.feed()) send(ws, { t: 'signal_row', row });
+        }
+      } else if (msg.t === 'unsub_signals') {
+        ws.signalsSubscribed = false;
+      }
     });
 
     ws.on('close', () => {
@@ -198,6 +227,30 @@ function attach(server) {
   return wss;
 }
 
+/**
+ * Fans an engine message out to the clients that asked for it.
+ *
+ * Analysis diffs go only to clients watching that exact symbol+interval, since
+ * they are useless anywhere else. Signals additionally reach anyone on the
+ * signals channel — that is the whole point of the feed.
+ */
+function broadcast(msg) {
+  if (!wss) return;
+  const key = msg.symbol && msg.interval ? `${msg.symbol}:${msg.interval}` : null;
+
+  for (const ws of wss.clients) {
+    if (ws.readyState !== ws.OPEN) continue;
+    const watching = key !== null && ws.subs && ws.subs.has(key);
+    const wantsFeed = ws.signalsSubscribed === true;
+
+    if (msg.t === 'analysis') {
+      if (watching) send(ws, msg);
+    } else if (msg.t === 'signal' || msg.t === 'outcome') {
+      if (watching || wantsFeed) send(ws, msg);
+    }
+  }
+}
+
 function close() {
   clearInterval(heartbeat);
   if (wss) {
@@ -208,4 +261,4 @@ function close() {
   upstream.closeAll();
 }
 
-module.exports = { attach, close, PATH };
+module.exports = { attach, close, broadcast, setSnapshotProvider, PATH };

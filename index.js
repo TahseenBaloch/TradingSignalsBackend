@@ -9,6 +9,12 @@ const { getChart } = require('./chart-service');
 const stream = require('./stream/server');
 const tickets = require('./stream/tickets');
 const backtestJobs = require('./backtest-jobs');
+const liveRunner = require('./live/runner');
+const analysisService = require('./live/analysis-service');
+const engineConfig = require('./engine/config');
+const statsStore = require('./engine/stats');
+const qualification = require('./engine/qualification');
+const reportStore = require('./store/reports');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -110,6 +116,36 @@ const server = app.listen(port, () => {
 
 stream.attach(server);
 
+// Live signal engine. Opt-in via env: it holds 35 keep-alive upstream sockets
+// and warms 35 series on boot, which is the wrong default for someone who just
+// wants the chart to come up.
+let live = null;
+if (process.env.LIVE_ENGINE === 'true') {
+  (async () => {
+    const config = engineConfig.resolve(process.env.LIVE_PRESET || engineConfig.DEFAULT_PRESET);
+    // Both files are written by scripts/seed.js. Without them the probability
+    // store is empty (every signal reads "insufficient data", per Rule 5) and
+    // the qualification gate is empty — which correctly disables everything
+    // rather than shipping unmeasured strategies live.
+    const store = statsStore.create((await reportStore.loadStats()) || {});
+    const gate = qualification.create((await reportStore.loadQualification()) || {});
+
+    const summary = qualification.summary(gate);
+    console.log(`[live] qualification gate: ${summary.qualified}/${summary.total} configs active`);
+
+    live = liveRunner.create({ config, store, gate, publish: stream.broadcast });
+
+    stream.setSnapshotProvider({
+      analysis: (symbol, interval) => analysisService.snapshotFor(live.analysis, symbol, interval),
+      feed: () => analysisService.feedRows(live.analysis, { limit: 50 }),
+    });
+
+    await liveRunner.start(live);
+  })().catch((err) => console.error('[live] failed to start:', err.message));
+} else {
+  console.log('[live] signal engine disabled (set LIVE_ENGINE=true to enable)');
+}
+
 // Without this, every nodemon restart leaks its upstream Binance sockets, and
 // Binance caps connection attempts at 300 per 5 minutes per IP.
 let shuttingDown = false;
@@ -119,6 +155,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     shuttingDown = true;
     console.log(`\n[shutdown] ${signal} received, closing connections`);
     stream.close();
+    if (live) liveRunner.stop(live);
     backtestJobs.shutdown(); // orphaned workers would outlive the server
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
