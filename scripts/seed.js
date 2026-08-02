@@ -19,6 +19,7 @@ const candleStore = require('../store/candles');
 const reportStore = require('../store/reports');
 const backtest = require('../engine/backtest');
 const config = require('../engine/config');
+const qualification = require('../engine/qualification');
 
 // Deeper history on the higher timeframes, where bars are cheap; 1m is capped
 // at 60 days because that alone is ~87 paginated requests per symbol.
@@ -186,6 +187,23 @@ async function main() {
     config.BACKTEST.probabilityMinSample
   );
   await reportStore.saveStats(store);
+
+  // Rule 7, made binding. Every config's out-of-sample result is recorded —
+  // passing or failing — and the live engine treats anything not recorded as
+  // qualifying as DISABLED. Nothing is hidden; the failures carry their reasons.
+  const gate = qualification.create();
+  for (const r of results) {
+    for (const tf of r.entryTimeframes) {
+      const perTf = r.walkForward.pooled.outOfSample;
+      qualification.record(
+        gate,
+        { symbol: r.symbol, timeframe: tf, preset: r.preset, strategyId: null },
+        perTf,
+        config.BACKTEST.qualification
+      );
+    }
+  }
+  await reportStore.saveQualification(gate);
 
   printCadence(results);
   printPerformance(results);

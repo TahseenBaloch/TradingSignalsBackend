@@ -42,4 +42,22 @@ async function listReports() {
 const saveStats = (store) => writeJson(STATS_FILE, store);
 const loadStats = () => readJson(STATS_FILE);
 
-module.exports = { saveReport, loadReport, listReports, saveStats, loadStats, ROOT, REPORTS, STATS_FILE };
+// Rule 7's verdict per configuration. Kept beside the stats it was derived from
+// so the two cannot drift out of step across a reseed.
+const QUALIFICATION_FILE = path.join(ROOT, 'qualification.json');
+const saveQualification = (gate) => writeJson(QUALIFICATION_FILE, gate);
+const loadQualification = () => readJson(QUALIFICATION_FILE);
+
+module.exports = {
+  saveReport,
+  loadReport,
+  listReports,
+  saveStats,
+  loadStats,
+  saveQualification,
+  loadQualification,
+  ROOT,
+  REPORTS,
+  STATS_FILE,
+  QUALIFICATION_FILE,
+};
