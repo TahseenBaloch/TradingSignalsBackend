@@ -4,10 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test \"engine/**/*.test.js\"",
+    "test": "node --test \"engine/**/*.test.js\" \"*.test.js\"",
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test:watch": "node --test --watch \"engine/**/*.test.js\""
+    "test:watch": "node --test --watch \"engine/**/*.test.js\" \"*.test.js\"",
+    "seed": "node scripts/seed.js"
   },
   "keywords": [],
   "type": "commonjs",

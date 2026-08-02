@@ -8,6 +8,7 @@ const { searchTickers } = require('./symbols');
 const { getChart } = require('./chart-service');
 const stream = require('./stream/server');
 const tickets = require('./stream/tickets');
+const backtestJobs = require('./backtest-jobs');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -61,6 +62,37 @@ app.post('/stream/ticket', requireAuth, (req, res) => {
   res.json(tickets.issue(req.user));
 });
 
+// Backtests run in a forked worker, never here: a seed-scale run is hundreds of
+// thousands of synchronous bar iterations and would block the event loop, which
+// on this server also means freezing every live WebSocket fan-out.
+app.post('/backtest', requireAuth, (req, res, next) => {
+  try {
+    res.status(202).json(backtestJobs.create(req.body || {}, req.user));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/backtest', requireAuth, (req, res) => {
+  res.json({ jobs: backtestJobs.list(req.user) });
+});
+
+app.get('/backtest/:id', requireAuth, async (req, res, next) => {
+  try {
+    res.json(await backtestJobs.get(req.params.id, req.user));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/backtest/:id', requireAuth, (req, res, next) => {
+  try {
+    res.json(backtestJobs.cancel(req.params.id, req.user));
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Terminal error handler. Without one, Express answers with an HTML error page
 // that the frontend proxy cannot parse into a useful message.
 app.use((err, req, res, _next) => {
@@ -87,6 +119,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     shuttingDown = true;
     console.log(`\n[shutdown] ${signal} received, closing connections`);
     stream.close();
+    backtestJobs.shutdown(); // orphaned workers would outlive the server
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   });
