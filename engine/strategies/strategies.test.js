@@ -346,7 +346,7 @@ test('S2 tier 2 needs the 2-sigma band AND an RSI recross', () => {
     rangingCtx({ bar: mkBar(98, { low: 97.9 }), rsi: 26, candles: [bullishCandle] }),
     state
   );
-  assert.equal(stillLow.score, p.baseScoreTier1);
+  assert.equal(stillLow.reasons.some((r) => r.id === 's2-rsi'), false, 'no recross, so tier 1');
 
   // Now RSI crosses back up through 30.
   const state2 = modules.s2.initState();
@@ -355,8 +355,14 @@ test('S2 tier 2 needs the 2-sigma band AND an RSI recross', () => {
     rangingCtx({ bar: mkBar(98, { low: 97.9 }), rsi: 34, candles: [bullishCandle] }),
     state2
   );
-  assert.equal(recross.score, p.baseScoreTier2);
   assert.ok(recross.reasons.some((r) => r.id === 's2-rsi'));
+  // Scores are compared, not pinned: both tiers now earn evidence bonuses on
+  // top of their base, and the point of the tiers is the GAP between them.
+  assert.equal(
+    recross.score - stillLow.score,
+    p.baseScoreTier2 - p.baseScoreTier1,
+    'the tier gap must survive the evidence bonuses'
+  );
 });
 
 test('S2 stands aside just after the UTC session reset', () => {
@@ -553,6 +559,68 @@ test('presets scale the thresholds and filters that drive cadence', () => {
 
   assert.equal(balanced.confluence.thresholds.strong, 65, 'Balanced matches the spec bands');
   assert.equal(balanced.confluence.thresholds.weak, 30);
+});
+
+test('every strategy can reach every preset conviction floor', () => {
+  // Regression. S6 shipped with a FIXED score of 40 against a Balanced floor of
+  // 45, so the designated frequency workhorse was structurally silent on two of
+  // three presets and contributed zero trades to an entire seed run — with
+  // nothing failing, because an absent strategy just does not appear.
+  for (const preset of ['Conservative', 'Balanced', 'Aggressive']) {
+    const resolved = config.resolve(preset);
+    const floor = resolved.limits.minStrategyScore;
+
+    for (const [key, s] of Object.entries(resolved.strategies)) {
+      if (!s.enabled || s.biasOnly) continue;
+      const ceiling = config.maxScoreOf(key, s);
+      assert.ok(
+        ceiling >= floor,
+        `${s.id} tops out at ${ceiling} but ${preset} requires ${floor}`
+      );
+    }
+  }
+});
+
+test('the reachability guard catches an unreachable or undeclared strategy', () => {
+  assert.throws(
+    () => config.assertReachable({ s4: { id: 's4-x', enabled: true, baseScore: 10 } }, 45, 'Balanced'),
+    /could never fire/
+  );
+
+  // An unknown key must NOT default to "unbounded" — defaulting to Infinity is
+  // how a newly added strategy would slip past the very check meant to catch it.
+  assert.throws(
+    () => config.assertReachable({ sZ: { id: 'new', enabled: true, baseScore: 99 } }, 45, 'Balanced'),
+    /No score ceiling defined/
+  );
+
+  // Bias-only modules never face the floor.
+  config.assertReachable({ s5: { id: 's5', enabled: true, biasOnly: true } }, 45, 'Balanced');
+});
+
+test('S6 scores its evidence rather than returning a constant', () => {
+  const state = modules.s6.initState();
+  modules.s6.evaluate(mkCtx({ stochastic: { k: 20, d: 25 } }), state);
+  const shallow = modules.s6.evaluate(
+    mkCtx({ index: 501, stochastic: { k: 30, d: 26 }, bar: mkBar(101) }),
+    state
+  );
+
+  const deepState = modules.s6.initState();
+  modules.s6.evaluate(mkCtx({ stochastic: { k: 5, d: 12 } }), deepState);
+  const deep = modules.s6.evaluate(
+    mkCtx({
+      index: 501,
+      stochastic: { k: 20, d: 15 },
+      bar: mkBar(101),
+      volume: { volume: 300, sma: 100, relative: 3 },
+    }),
+    deepState
+  );
+
+  assert.ok(deep.score > shallow.score, 'a deeper cross on heavier volume must score higher');
+  assert.ok(deep.reasons.some((r) => r.id === 's6-depth'));
+  assert.ok(deep.reasons.some((r) => r.id === 's6-volbonus'));
 });
 
 test('config.resolve is pure and rejects an unknown preset', () => {

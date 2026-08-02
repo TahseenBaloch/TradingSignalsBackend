@@ -251,7 +251,7 @@ const s2 = {
       (direction === 'long' && touched2Low && recrossedUp) ||
       (direction === 'short' && touched2High && recrossedDown);
 
-    const score = tier2 ? p.baseScoreTier2 : p.baseScoreTier1;
+    let score = tier2 ? p.baseScoreTier2 : p.baseScoreTier1;
     const band = tier2 ? 2 : 1;
 
     const reasons = [
@@ -263,6 +263,31 @@ const s2 = {
     ];
     if (tier2) {
       reasons.push(evidence('s2-rsi', 'RSI recross', `RSI back through ${direction === 'long' ? p.rsiOversold : p.rsiOverbought} (${ctx.rsi.toFixed(1)})`, p.baseScoreTier2 - p.baseScoreTier1));
+    }
+
+    // Same reasoning as S6: tier 1 sat exactly on the Balanced floor and below
+    // the Conservative one, so it could never survive the stricter preset.
+    // Earning score from independent evidence is what lets the floor filter
+    // instances rather than the whole tier.
+    const strongCandle = strongestCandle(ctx, direction);
+    if (strongCandle && strongCandle.strength > 1) {
+      const bump = p.candleBonus * (strongCandle.strength - 1);
+      score += bump;
+      reasons.push(evidence('s2-candle', 'Rejection candle', `${strongCandle.type} (strength ${strongCandle.strength})`, bump));
+    }
+
+    const bandZone = (ctx.structure.zones || []).find(
+      (z) => ctx.bar.low <= z.high + touch && ctx.bar.high >= z.low - touch
+    );
+    if (bandZone) {
+      score += p.zoneBonus;
+      reasons.push(evidence('s2-zone', 'S/R zone', `Band touch coincides with a ${bandZone.touches}-touch zone`, p.zoneBonus, { time: ctx.bar.time, price: bandZone.centre }));
+    }
+
+    const quality = ctx.structure.regime.rangeQuality;
+    if (quality >= p.strongRangeQuality) {
+      score += p.rangeQualityBonus;
+      reasons.push(evidence('s2-quality', 'Clean range', `Range quality ${quality.toFixed(2)}`, p.rangeQualityBonus));
     }
 
     // Stop beyond the next band out; a 2σ entry stops beyond 3σ.
@@ -529,17 +554,50 @@ const s6 = {
         : ctx.bar.close + p.stopAtr * ctx.atr;
     const r = p.stopAtr * ctx.atr;
 
+    const reasons = [
+      evidence('s6-stoch', 'Stochastic cross', `%K crossed %D out of ${crossUp ? 'oversold' : 'overbought'} (${k.toFixed(1)}/${d.toFixed(1)})`, 0),
+      evidence('s6-trend', '15m trend', `Aligned with the 15m ${trend15.trend.state} trend`, 0),
+      evidence('s6-vwap', 'VWAP side', `Price on the ${direction === 'long' ? 'upper' : 'lower'} side of session VWAP`, 0),
+      evidence('s6-volume', 'Volume', `Relative volume ${ctx.volume.relative.toFixed(2)}`, 0),
+    ];
+
+    // S6 used to return a FIXED score, which made the preset's conviction floor
+    // unable to do its job: instead of filtering weak instances it silenced the
+    // whole strategy wherever base < floor. Scoring the evidence gives the floor
+    // something to discriminate on, which is what it was always meant to do.
+    let score = p.baseScore;
+
+    // How far out of the extreme the cross came from: a turn from 12 is a
+    // stronger reversal than one from 29.
+    const depth = crossUp ? Math.max(0, p.stochLow - prev.k) : Math.max(0, prev.k - p.stochHigh);
+    const depthBonus = Math.round(Math.min(1, depth / p.stochLow) * p.depthBonus);
+    if (depthBonus > 0) {
+      score += depthBonus;
+      reasons.push(evidence('s6-depth', 'Extreme depth', `Crossed up from %K ${prev.k.toFixed(1)}`, depthBonus));
+    }
+
+    const volumeBonus = Math.round(
+      Math.min(1, (ctx.volume.relative - p.minRelativeVolume) / p.minRelativeVolume) * p.volumeBonus
+    );
+    if (volumeBonus > 0) {
+      score += volumeBonus;
+      reasons.push(evidence('s6-volbonus', 'Participation', `Relative volume ${ctx.volume.relative.toFixed(2)}`, volumeBonus));
+    }
+
+    // A cross with the 15m trend unanimous behind it is worth more than one
+    // against a barely-established trend.
+    const trendBonus = Math.round((Math.abs(trend15.trend.score || 0) / 3) * p.trendBonus);
+    if (trendBonus > 0) {
+      score += trendBonus;
+      reasons.push(evidence('s6-trendstrength', 'Trend strength', `15m trend score ${trend15.trend.score}`, trendBonus));
+    }
+
     return makeSignal(ctx, {
       direction,
-      score: p.baseScore,
+      score,
       entry: ctx.bar.close,
       sl1,
-      reasons: [
-        evidence('s6-stoch', 'Stochastic cross', `%K crossed %D out of ${crossUp ? 'oversold' : 'overbought'} (${k.toFixed(1)}/${d.toFixed(1)})`, 0),
-        evidence('s6-trend', '15m trend', `Aligned with the 15m ${trend15.trend.state} trend`, 0),
-        evidence('s6-vwap', 'VWAP side', `Price on the ${direction === 'long' ? 'upper' : 'lower'} side of session VWAP`, 0),
-        evidence('s6-volume', 'Volume', `Relative volume ${ctx.volume.relative.toFixed(2)}`, 0),
-      ],
+      reasons,
       measuredTarget:
         direction === 'long'
           ? ctx.bar.close + p.targetMultiples[1] * r

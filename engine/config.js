@@ -126,6 +126,13 @@ const STRATEGIES = {
     allowedRegimes: ['RANGING'],
     baseScoreTier1: 45,
     baseScoreTier2: 70,
+    // Evidence bonuses. Without these, tier 1 sat exactly on the Balanced
+    // conviction floor and below the Conservative one, so the floor silenced
+    // the whole tier instead of filtering weak instances of it.
+    candleBonus: 6,
+    zoneBonus: 10,
+    rangeQualityBonus: 8,
+    strongRangeQuality: 0.6,
     touchAtr: 0.2,
     rsiOversold: 30,
     rsiOverbought: 70,
@@ -197,6 +204,14 @@ const STRATEGIES = {
     timeframes: ['1m', '5m'],
     allowedRegimes: ['TRENDING', 'RANGING', 'SQUEEZE', 'VOLATILE_EXPANSION'],
     baseScore: 40,
+    // S6 previously returned a FIXED 40, below the Balanced (45) and
+    // Conservative (55) conviction floors — so the frequency workhorse was
+    // structurally silent on two of three presets and contributed zero trades
+    // to the first seed run. These bonuses let it earn its way past the floor
+    // on the instances that deserve it. Max reachable: 40 + 15 + 10 + 10 = 75.
+    depthBonus: 15, // how far out of the extreme the cross came from
+    volumeBonus: 10,
+    trendBonus: 10, // strength of the 15m trend it is aligned with
     stochLow: 30,
     stochHigh: 70,
     minRelativeVolume: 1.2,
@@ -342,6 +357,9 @@ function resolve(presetName = DEFAULT_PRESET) {
     throw new Error(`Unknown preset "${presetName}". Known: ${Object.keys(PRESETS).join(', ')}`);
   }
 
+  const strategies = applyPreset(STRATEGIES, preset);
+  assertReachable(strategies, preset.minStrategyScore, presetName);
+
   return {
     preset: presetName,
     timeframes: TIMEFRAMES,
@@ -354,7 +372,7 @@ function resolve(presetName = DEFAULT_PRESET) {
     candles: CANDLES,
     patterns: PATTERNS,
     ladder: LADDER,
-    strategies: applyPreset(STRATEGIES, preset),
+    strategies,
     confluence: { ...CONFLUENCE, thresholds: preset.thresholds },
     costs: COSTS,
     backtest: BACKTEST,
@@ -363,6 +381,61 @@ function resolve(presetName = DEFAULT_PRESET) {
       requireCandleConfirmation: preset.requireCandleConfirmation,
     },
   };
+}
+
+/**
+ * Highest score a strategy can possibly emit, given its parameters.
+ *
+ * Used only by the guard below. It is deliberately hand-maintained rather than
+ * derived: if someone adds a bonus to a strategy and forgets to account for it
+ * here, the guard becomes conservative (it under-estimates the ceiling and may
+ * complain), which is the safe direction to be wrong in.
+ */
+function maxScoreOf(key, s) {
+  switch (key) {
+    case 's1':
+      return s.baseScore + s.candleStrengthBonus * 3 + s.zoneBonus + s.trendlineBonus;
+    case 's2':
+      // The floor has to be reachable by TIER 1, not just by the rarer tier 2.
+      return s.baseScoreTier1 + s.candleBonus * 2 + s.zoneBonus + s.rangeQualityBonus;
+    case 's3':
+      return s.baseScore + s.patternBonus;
+    case 's4':
+      return s.baseScore;
+    case 's6':
+      return s.baseScore + s.depthBonus + s.volumeBonus + s.trendBonus;
+    default:
+      // NOT Infinity. Defaulting to "unbounded" would let a newly added
+      // strategy slip past the very check that exists to catch an unreachable
+      // one — which is exactly how S6 went missing. Bias-only modules never
+      // reach here; assertReachable skips them before calling this.
+      throw new Error(
+        `No score ceiling defined for strategy "${key}". Add one to maxScoreOf() ` +
+          `so the conviction-floor guard can verify it is reachable.`
+      );
+  }
+}
+
+/**
+ * Guards against a conviction floor that silences a whole strategy instead of
+ * filtering weak instances of it.
+ *
+ * This is the check that was missing when S6 shipped with a fixed score of 40
+ * against a Balanced floor of 45: the frequency workhorse contributed zero
+ * trades to an entire seed run, and nothing failed — the strategy was simply
+ * absent from every report. A silent strategy is far worse than a loud bug.
+ */
+function assertReachable(strategies, floor, preset) {
+  for (const [key, s] of Object.entries(strategies)) {
+    if (!s.enabled || s.biasOnly) continue;
+    const ceiling = maxScoreOf(key, s);
+    if (ceiling < floor) {
+      throw new Error(
+        `Strategy ${s.id} can score at most ${ceiling} but preset "${preset}" requires ` +
+          `${floor}; it could never fire. Raise its evidence bonuses or lower minStrategyScore.`
+      );
+    }
+  }
 }
 
 /** Folds preset-scaled filter strictness into each strategy's parameters. */
@@ -394,4 +467,6 @@ module.exports = {
   COSTS,
   BACKTEST,
   resolve,
+  maxScoreOf,
+  assertReachable,
 };
