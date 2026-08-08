@@ -56,6 +56,10 @@ function compact(event) {
     topReason: topReason ? `${topReason.label}: ${topReason.detail}` : null,
     probability: event.probability,
     regime: event.regime,
+    // Carried into the row so a forced config is visibly marked in the feed,
+    // not just in the HUD the user may not have open.
+    overridden: Boolean(event.overridden),
+    failedReasons: event.failedReasons || [],
   };
 }
 

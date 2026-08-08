@@ -166,6 +166,23 @@ function onBarClosed(service, symbol, timeframe, bar) {
       });
       event = { ...event, actionable: false, suppressed: true, suppressedReason: why.reasons.join('; ') };
     } else if (entry.warmed) {
+      // Live only because someone forced it. The flag travels with the event so
+      // every consumer — feed row, HUD, position drawing — can say so, rather
+      // than presenting a failing configuration as a qualified one.
+      const forced = qualification.describe(service.gate, {
+        symbol,
+        timeframe,
+        preset: service.config.preset,
+        strategyId: null,
+      });
+      if (forced.override) {
+        event = {
+          ...event,
+          overridden: true,
+          overrideNote: forced.overrideNote,
+          failedReasons: forced.failedReasons || [],
+        };
+      }
       confluenceFeed.add(service.feed, event);
       trackPosition(service, symbol, event);
     }

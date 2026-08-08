@@ -90,6 +90,40 @@ function describe(store, spec) {
   };
 }
 
+/**
+ * Force-enables a configuration that did NOT clear its bar.
+ *
+ * Deliberately a separate function rather than a `qualified: true` write,
+ * because the two must never be confusable. An override keeps the failing
+ * measurements intact and adds `override: true` plus the original reasons, so
+ * every consumer can tell a config that earned its place from one that was
+ * switched on by hand — and the UI can say so on every signal it produces.
+ *
+ * This exists for demonstrating the signal path end to end. It is not a way to
+ * make a losing strategy pass.
+ */
+function override(store, spec, note = 'manually enabled') {
+  const existing = describe(store, spec);
+  store.entries[keyOf(spec)] = {
+    ...existing,
+    key: keyOf(spec),
+    ...spec,
+    qualified: true,
+    override: true,
+    overrideNote: note,
+    // Preserved, not cleared: this is why the override is a lie worth labelling.
+    failedReasons: existing.reasons,
+    reasons: [],
+  };
+  return store;
+}
+
+/** True when a config is live only because someone forced it. */
+function isOverridden(store, spec) {
+  const entry = describe(store, spec);
+  return Boolean(entry.override);
+}
+
 /** Every recorded config, qualified or not — the Backtest page's source table. */
 function list(store) {
   return Object.values(store.entries).sort(
@@ -102,4 +136,14 @@ const summary = (store) => {
   return { total: all.length, qualified: all.filter((e) => e.qualified).length };
 };
 
-module.exports = { create, record, isActive, describe, list, summary, keyOf };
+module.exports = {
+  create,
+  record,
+  override,
+  isOverridden,
+  isActive,
+  describe,
+  list,
+  summary,
+  keyOf,
+};

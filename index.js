@@ -130,6 +130,26 @@ if (process.env.LIVE_ENGINE === 'true') {
     const store = statsStore.create((await reportStore.loadStats()) || {});
     const gate = qualification.create((await reportStore.loadQualification()) || {});
 
+    // Force-enable specific configurations, e.g. LIVE_FORCE_ENABLE=BTCUSD:1m,BTCUSD:5m
+    //
+    // For demonstrating the signal path. These configurations FAILED their
+    // out-of-sample bar; the override keeps their real numbers and marks every
+    // signal they produce, so nothing here can be mistaken for a strategy that
+    // earned its place.
+    if (process.env.LIVE_FORCE_ENABLE) {
+      for (const pair of process.env.LIVE_FORCE_ENABLE.split(',')) {
+        const [symbol, timeframe] = pair.trim().split(':');
+        if (!symbol || !timeframe) continue;
+        const spec = { symbol, timeframe, preset: config.preset, strategyId: null };
+        const before = qualification.describe(gate, spec);
+        qualification.override(gate, spec, 'forced via LIVE_FORCE_ENABLE');
+        console.warn(
+          `[live] OVERRIDE ${symbol} ${timeframe}: enabling a config that failed — ` +
+            `${before.reasons.join('; ') || 'never backtested'}`
+        );
+      }
+    }
+
     const summary = qualification.summary(gate);
     console.log(`[live] qualification gate: ${summary.qualified}/${summary.total} configs active`);
 

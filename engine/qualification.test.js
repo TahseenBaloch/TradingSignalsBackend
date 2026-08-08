@@ -69,6 +69,32 @@ test('a symbol-specific verdict beats the general one', () => {
   );
 });
 
+test('an override enables a config but keeps it distinguishable from a real pass', () => {
+  // The whole point: forcing a strategy on must never look like it earned its
+  // place. The failing numbers survive, and the override is flagged.
+  const gate = qualification.create();
+  qualification.record(gate, spec, { trades: 400, profitFactor: 0.18, expectancyR: -0.87 }, RULE);
+  assert.equal(qualification.isActive(gate, spec), false);
+
+  qualification.override(gate, spec, 'forced via LIVE_FORCE_ENABLE');
+
+  assert.equal(qualification.isActive(gate, spec), true, 'signals now flow');
+  assert.equal(qualification.isOverridden(gate, spec), true, 'and are marked as forced');
+
+  const entry = qualification.describe(gate, spec);
+  assert.equal(entry.override, true);
+  assert.equal(entry.overrideNote, 'forced via LIVE_FORCE_ENABLE');
+  assert.equal(entry.profitFactor, 0.18, 'the real measurement is not overwritten');
+  assert.match(entry.failedReasons[0], /profit factor 0.18/, 'and neither is the reason it failed');
+});
+
+test('a genuinely qualified config is not marked as overridden', () => {
+  const gate = qualification.create();
+  qualification.record(gate, spec, { trades: 200, profitFactor: 1.5, expectancyR: 0.2 }, RULE);
+  assert.equal(qualification.isActive(gate, spec), true);
+  assert.equal(qualification.isOverridden(gate, spec), false);
+});
+
 test('the listing surfaces qualified configs first and counts them', () => {
   const gate = qualification.create();
   qualification.record(gate, spec, { trades: 400, profitFactor: 0.3, expectancyR: -0.4 }, RULE);
