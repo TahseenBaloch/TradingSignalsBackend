@@ -133,7 +133,14 @@ if (process.env.LIVE_ENGINE === 'true') {
     const summary = qualification.summary(gate);
     console.log(`[live] qualification gate: ${summary.qualified}/${summary.total} configs active`);
 
-    live = liveRunner.create({ config, store, gate, publish: stream.broadcast });
+    // Restricting the watch set matters in development: the full 7 symbols x 5
+    // timeframes means 35 warmup fetches and 35 staggered connects before the
+    // first signal, which is a long wait when you are checking one chart.
+    const watched = process.env.LIVE_SYMBOLS
+      ? process.env.LIVE_SYMBOLS.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+
+    live = liveRunner.create({ config, store, gate, publish: stream.broadcast, symbols: watched });
 
     stream.setSnapshotProvider({
       analysis: (symbol, interval) => analysisService.snapshotFor(live.analysis, symbol, interval),

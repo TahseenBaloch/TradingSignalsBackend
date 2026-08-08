@@ -58,6 +58,7 @@ function analyzerFor(service, symbol, timeframe) {
       state: pipeline.createAnalyzer({ symbol, timeframe, config: service.config }),
       lastBarTime: null,
       lastSnapshot: null,
+      lastOut: null,
       warmed: false,
     };
     service.analyzers.set(key, entry);
@@ -73,11 +74,24 @@ function analyzerFor(service, symbol, timeframe) {
 function warmup(service, symbol, timeframe, bars) {
   const entry = analyzerFor(service, symbol, timeframe);
   const usable = bars.slice(-WARMUP_BARS);
+  let last = null;
   for (const bar of usable) {
-    pipeline.update(entry.state, bar, { bias: biasFor(service, symbol, timeframe), store: service.store });
+    last = pipeline.update(entry.state, bar, {
+      bias: biasFor(service, symbol, timeframe),
+      store: service.store,
+    });
     entry.lastBarTime = bar.time;
   }
   entry.warmed = usable.length >= 250;
+
+  // Store the snapshot warmup just produced. Without this, lastSnapshot stays
+  // null until the FIRST live close on this timeframe, so a client that
+  // subscribes right after boot is handed { full: null } and renders an empty
+  // chart — for up to five minutes on 5m, and up to four hours on 4h.
+  if (last) {
+    entry.lastOut = last;
+    entry.lastSnapshot = buildSnapshot(service, symbol, timeframe, last);
+  }
   return entry;
 }
 
@@ -127,7 +141,8 @@ function onBarClosed(service, symbol, timeframe, bar) {
 
   advanceOpenPositions(service, symbol, bar);
 
-  const snapshot = buildSnapshot(symbol, timeframe, out);
+  entry.lastOut = out;
+  const snapshot = buildSnapshot(service, symbol, timeframe, out);
   const diff = diffSnapshots(entry.lastSnapshot, snapshot);
   entry.lastSnapshot = snapshot;
 
@@ -162,14 +177,41 @@ function onBarClosed(service, symbol, timeframe, bar) {
   return { event, diff };
 }
 
+/**
+ * Cross-timeframe summary for the HUD's MTF matrix.
+ *
+ * Sent with every analysis payload because the client subscribes to exactly ONE
+ * timeframe: without this the matrix could only ever fill the row it is already
+ * looking at, which defeats the point of a "check the other timeframes before
+ * you act" view. The server analyses all of them anyway, so this is free.
+ */
+function mtfSummary(service, symbol) {
+  return service.config.timeframes.seconds
+    ? ['1m', '5m', '15m', '1h', '4h'].map((tf) => {
+        const entry = service.analyzers.get(keyOf(symbol, tf));
+        const ctx = entry && entry.state.latest;
+        if (!ctx) return { timeframe: tf, trend: null, regime: null, rsi: null, macd: null, supertrend: null };
+        return {
+          timeframe: tf,
+          trend: ctx.structure.trend.state,
+          regime: ctx.structure.regime.primary,
+          rsi: ctx.rsi,
+          macd: ctx.macd && ctx.macd.histogram !== null ? (ctx.macd.histogram > 0 ? 'up' : 'down') : null,
+          supertrend: ctx.supertrend ? ctx.supertrend.direction : null,
+        };
+      })
+    : [];
+}
+
 /** The client-facing projection of one bar's analysis. */
-function buildSnapshot(symbol, timeframe, out) {
+function buildSnapshot(service, symbol, timeframe, out) {
   const view = structure.snapshot(out.ctx.structure);
   const patternView = patterns.snapshot(out.patterns);
 
   return {
     symbol,
     timeframe,
+    mtf: mtfSummary(service, symbol),
     barTime: out.ctx.bar.time,
     zones: view.zones.map((z) => ({
       id: z.id,
@@ -240,12 +282,20 @@ function diffSnapshots(previous, next) {
 
   // Per-bar values are always sent; they are small and always change.
   diff.candles = next.candles;
+  diff.mtf = next.mtf;
   if (previous.trend !== next.trend) diff.trend = next.trend;
   if (previous.regime !== next.regime) diff.regime = next.regime;
   if (next.events.length) diff.events = next.events;
 
   const meaningful =
-    diff.zones || diff.trendlines || diff.patterns || diff.trend || diff.regime || diff.events || diff.candles.length;
+    diff.zones ||
+    diff.trendlines ||
+    diff.patterns ||
+    diff.trend ||
+    diff.regime ||
+    diff.events ||
+    diff.candles.length ||
+    JSON.stringify(previous.mtf) !== JSON.stringify(next.mtf);
   return meaningful ? diff : null;
 }
 
@@ -304,6 +354,19 @@ function advanceOpenPositions(service, symbol, bar) {
   );
 }
 
+/**
+ * Rebuilds an analyzer's snapshot from its current state, without feeding a bar.
+ *
+ * Needed after a batch warmup: snapshots built mid-warmup captured whichever
+ * sibling timeframes happened to be warm at that moment.
+ */
+function refreshSnapshot(service, symbol, timeframe) {
+  const entry = service.analyzers.get(keyOf(symbol, timeframe));
+  if (!entry || !entry.lastOut) return null;
+  entry.lastSnapshot = buildSnapshot(service, symbol, timeframe, entry.lastOut);
+  return entry.lastSnapshot;
+}
+
 /** Full state for a client that has just subscribed or reconnected. */
 function snapshotFor(service, symbol, timeframe) {
   const entry = service.analyzers.get(keyOf(symbol, timeframe));
@@ -332,6 +395,7 @@ function divergence(service, query) {
 module.exports = {
   create,
   warmup,
+  refreshSnapshot,
   onBarClosed,
   snapshotFor,
   feedRows,

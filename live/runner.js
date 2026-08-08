@@ -71,6 +71,16 @@ async function start(runner, { log = console.log } = {}) {
     }
   }
 
+  // Rebuild every snapshot now that ALL series are warm. Warmup runs longest
+  // timeframe first, so a snapshot built during 5m's warmup captured a 1m
+  // analyzer that had not run yet — leaving a hole in the MTF matrix until the
+  // next 5m close. One pass here fills it immediately.
+  for (const timeframe of ordered) {
+    for (const symbol of runner.symbols) {
+      service.refreshSnapshot(runner.analysis, symbol.symbol, timeframe);
+    }
+  }
+
   let delay = 0;
   for (const timeframe of ordered) {
     for (const symbol of runner.symbols) {
