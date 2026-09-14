@@ -4,23 +4,15 @@ const { INTERVALS, resolveInterval, SUPPORTED } = require('./intervals');
 const { httpError } = require('./http-error');
 const { fetchAggTrades } = require('./providers/binance-trades');
 
-// Per-bar order flow built from aggregated trades: the buy/sell split at each
-// price level (a footprint), plus the bar totals the Flow tools summarise.
-//
-// Klines cannot produce this. A kline knows a bar's total volume but not which
-// side crossed the spread, so delta, imbalance and absorption are all invisible
-// from OHLCV alone - hence a separate endpoint rather than more fields on
-// /chart.
+// Per-bar order flow from aggTrades: a kline knows a bar's total volume but not which side crossed the spread, so delta and imbalance are invisible from OHLCV.
 
 const CACHE_VERSION = 'v1';
 const DEFAULT_BARS = 40;
 const MAX_BARS = 120;
-// Closed bars can never change, so their footprint is cached effectively
-// forever. Only the forming bar needs a short TTL.
+// Closed bars can never change, so only the forming bar needs a short TTL.
 const CLOSED_TTL_SECONDS = 7 * 24 * 3600;
 const FORMING_TTL_SECONDS = 10;
-// Binance permits far more, but the point of a limit is to stay a good citizen
-// when someone asks for 120 bars at once.
+// Binance permits far more; the cap is to stay a good citizen on a 120-bar request.
 const CONCURRENCY = 6;
 
 function parseBars(raw) {
@@ -41,12 +33,7 @@ function parseBucket(raw) {
   return n;
 }
 
-/**
- * Price granularity for the footprint rows. Raw trade prices are far too fine
- * to read - one weekday gold M5 bar prints ~84 distinct prices across an $8
- * range - so trades are grouped into buckets. Derived from the symbol's own
- * scale so this works for a $4000 metal and a $0.07 altcoin alike.
- */
+/** Footprint row granularity, derived from the symbol's own scale so a $4000 metal and a $0.07 altcoin both read well. */
 function defaultBucket(trades) {
   if (!trades.length) return 0.01;
   let min = Infinity;
@@ -57,8 +44,7 @@ function defaultBucket(trades) {
   }
   const span = max - min;
   if (!(span > 0)) return Math.max(0.01, max * 1e-5);
-  // Aim for roughly 20 rows per bar, then snap to a round increment so rows
-  // line up across bars instead of drifting.
+  // Aim for ~20 rows per bar, then snap to a round increment so rows line up across bars.
   const target = span / 20;
   const magnitude = 10 ** Math.floor(Math.log10(target));
   for (const step of [1, 2.5, 5, 10]) {
@@ -191,8 +177,7 @@ async function getFlow({ symbol: symbolInput, interval: intervalInput, bars: bar
 
   const built = await pooled(jobs, CONCURRENCY);
 
-  // Cumulative delta runs across the returned window, so the caller does not
-  // have to reduce it and every tool agrees on the same running total.
+  // Cumulative delta runs across the returned window, so every tool agrees on one running total.
   let cumulative = 0;
   for (const bar of built) {
     cumulative = round(cumulative + bar.delta);

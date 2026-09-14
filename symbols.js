@@ -1,13 +1,4 @@
-// The tradable universe. One row per symbol we serve, mapping our public
-// symbol to the upstream provider that actually has the data.
-//
-// `aliases` are extra search terms only — they never resolve a symbol, so no
-// alias can shadow a real ticker.
-//
-// `smtPeer` names the instrument this one is compared against for SMT
-// divergence: two markets that should move together, where one making a new
-// extreme and the other failing to exposes a move without real participation.
-// Pairs must be mutual.
+// One row per symbol we serve. `aliases` are search-only and never resolve a symbol; `smtPeer` pairs must be mutual.
 const SYMBOLS = [
   { symbol: 'BTCUSD', name: 'Bitcoin / U.S. Dollar', exchange: 'BINANCE', provider: 'binance', providerSymbol: 'BTCUSDT', smtPeer: 'ETHUSD' },
   { symbol: 'ETHUSD', name: 'Ethereum / U.S. Dollar', exchange: 'BINANCE', provider: 'binance', providerSymbol: 'ETHUSDT', smtPeer: 'BTCUSD' },
@@ -17,13 +8,7 @@ const SYMBOLS = [
   { symbol: 'ADAUSD', name: 'Cardano / U.S. Dollar', exchange: 'BINANCE', provider: 'binance', providerSymbol: 'ADAUSDT' },
   { symbol: 'DOGEUSD', name: 'Dogecoin / U.S. Dollar', exchange: 'BINANCE', provider: 'binance', providerSymbol: 'DOGEUSDT' },
 
-  // Gold. PAX Gold is redeemable one-for-one for a troy ounce of LBMA gold, so
-  // it prints within a few dollars of spot XAU/USD and on the same scale, which
-  // is what the chart's indicators are calibrated against. It is NOT spot gold:
-  // it carries its own premium, its volume is the token's rather than the
-  // metal's, and it trades through the weekend where XAU/USD gaps. Swap this
-  // row's provider for a real metals feed when one is available and the tools
-  // downstream need no changes.
+  // PAX Gold tracks spot XAU/USD within a few dollars but is not spot gold: own premium, token volume, and no weekend gap.
   {
     symbol: 'PAXGUSD',
     name: 'PAX Gold / U.S. Dollar',
@@ -34,11 +19,7 @@ const SYMBOLS = [
     smtPeer: 'XAUTUSD',
   },
 
-  // Tether Gold. Carried specifically as PAX Gold's SMT peer: both are redeemable
-  // for the same metal, so they track each other closely and a divergence
-  // between them is a participation signal rather than a correlation artifact.
-  // It is the thinner of the two (a fifth of PAXG's trade count), which is why
-  // PAXG stays the primary gold symbol.
+  // Tether Gold, carried as PAXG's SMT peer: same metal, but a fifth of the trade count, so PAXG stays primary.
   {
     symbol: 'XAUTUSD',
     name: 'Tether Gold / U.S. Dollar',
@@ -52,8 +33,7 @@ const SYMBOLS = [
 
 const BY_SYMBOL = new Map(SYMBOLS.map((s) => [s.symbol, s]));
 
-// Public projection for GET /tickers. Provider details stay server-side so the
-// registry can grow new fields (or a second provider) without changing the API.
+// Public projection for GET /tickers; provider details stay server-side so the registry can grow without changing the API.
 const tickers = SYMBOLS.map(({ symbol, name, exchange, smtPeer }) => ({
   symbol,
   name,

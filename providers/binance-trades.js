@@ -1,23 +1,13 @@
 const { httpError } = require('../http-error');
 
-// Aggregated trades from Binance. Same shape of client as providers/binance.js
-// (timeouts, circuit breaker, 502 on a bad symbol) but a different endpoint:
-// /aggTrades gives every trade in a time window with the aggressor side, which
-// is what the order-flow tools need and klines cannot provide.
+// aggTrades client: same timeouts and circuit breaker as providers/binance.js, but the endpoint that carries aggressor side.
 const BASE = process.env.BINANCE_BASE_URL || 'https://api.binance.com';
 const TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 8000;
 const MAX_LIMIT = 1000; // Binance's hard cap for /api/v3/aggTrades
 
 let circuitOpenUntil = 0;
 
-/**
- * Raw aggTrade: { a, p, q, f, l, T, m, M }.
- *
- * `m` is "was the BUYER the maker". So m === true means the seller crossed the
- * spread and the volume is sell-side aggression; m === false means the buyer
- * did. Getting this backwards silently inverts every delta downstream, which is
- * why it is normalized once, here, rather than at each call site.
- */
+/** Binance's `m` means "was the buyer the maker", so aggressor side is normalized once here - backwards silently inverts every delta downstream. */
 function normalize(raw) {
   const trades = [];
   for (const t of raw) {
@@ -70,9 +60,7 @@ async function fetchAggTrades({ providerSymbol, startMs, endMs }) {
     throw httpError(502, 'upstream_bad_payload', 'Unexpected response from market data provider');
   }
 
-  // A window busier than the cap returns its first 1000 trades, not a spread
-  // sample, so the tail would be silently missing. Report it rather than
-  // pretending the bar is complete.
+  // A window busier than the cap returns its first 1000 trades, not a sample, so report it rather than pretending the bar is complete.
   return { trades: normalize(raw), truncated: raw.length >= MAX_LIMIT };
 }
 

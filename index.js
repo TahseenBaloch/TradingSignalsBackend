@@ -44,8 +44,7 @@ app.get('/tickers', requireAuth, (req, res) => {
   res.json({ tickers: searchTickers(q) });
 });
 
-// Closed OHLCV bars from the upstream market data provider, Redis-cached.
-// The bar currently forming is never returned - see chart-service.js.
+// Closed OHLCV bars from the upstream provider, Redis-cached; the forming bar is never returned.
 app.get('/chart', requireAuth, async (req, res, next) => {
   try {
     const { symbol, interval, limit } = req.query;
@@ -55,10 +54,7 @@ app.get('/chart', requireAuth, async (req, res, next) => {
   }
 });
 
-// Per-bar order flow from aggregated trades: the buy/sell split at each price
-// level, plus bar delta and cumulative delta. Separate from /chart because it
-// is a different upstream endpoint with a much heavier payload, and only the
-// Flow tools need it.
+// Per-bar order flow. Separate from /chart: different upstream, far heavier payload, and only the Flow tools need it.
 app.get('/flow', requireAuth, async (req, res, next) => {
   try {
     const { symbol, interval, bars, bucket } = req.query;
@@ -68,15 +64,13 @@ app.get('/flow', requireAuth, async (req, res, next) => {
   }
 });
 
-// Exchanges a normal bearer token for a short-lived ticket the browser can put
-// in a WebSocket URL, since a WebSocket cannot carry an Authorization header.
+// A WebSocket cannot carry an Authorization header, so a bearer token is exchanged for a short-lived ticket.
 app.post('/stream/ticket', requireAuth, (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json(tickets.issue(req.user));
 });
 
-// Terminal error handler. Without one, Express answers with an HTML error page
-// that the frontend proxy cannot parse into a useful message.
+// Terminal error handler: without one Express answers HTML the frontend proxy cannot parse.
 app.use((err, req, res, _next) => {
   const status = err.status || 500;
   if (status >= 500) console.error('[error]', err.code || 'internal_error', err.message);
@@ -92,8 +86,7 @@ const server = app.listen(port, () => {
 
 stream.attach(server);
 
-// Without this, every nodemon restart leaks its upstream Binance sockets, and
-// Binance caps connection attempts at 300 per 5 minutes per IP.
+// Without this every nodemon restart leaks upstream sockets, and Binance caps attempts at 300 per 5 minutes per IP.
 let shuttingDown = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
