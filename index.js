@@ -6,6 +6,7 @@ const { findUserByEmail } = require('./users');
 const { signToken, requireAuth } = require('./auth');
 const { searchTickers } = require('./symbols');
 const { getChart } = require('./chart-service');
+const { getFlow } = require('./flow-service');
 const stream = require('./stream/server');
 const tickets = require('./stream/tickets');
 
@@ -49,6 +50,19 @@ app.get('/chart', requireAuth, async (req, res, next) => {
   try {
     const { symbol, interval, limit } = req.query;
     res.json(await getChart({ symbol, interval, limit }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Per-bar order flow from aggregated trades: the buy/sell split at each price
+// level, plus bar delta and cumulative delta. Separate from /chart because it
+// is a different upstream endpoint with a much heavier payload, and only the
+// Flow tools need it.
+app.get('/flow', requireAuth, async (req, res, next) => {
+  try {
+    const { symbol, interval, bars, bucket } = req.query;
+    res.json(await getFlow({ symbol, interval, bars, bucket }));
   } catch (err) {
     next(err);
   }
