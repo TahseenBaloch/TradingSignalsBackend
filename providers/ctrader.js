@@ -47,25 +47,32 @@ function labelFor(interval, openSec) {
   return openSec;
 }
 
+/** One cTrader trendbar as a chart bar, or null if malformed. Shared by history and the live stream so both date and price bars identically. A live trendbar may omit deltaClose (its close is the current bid), which `hasClose` reports. */
+function decodeTrendbar(t, interval, digits, nowSec) {
+  const open = Number(t.utcTimestampInMinutes) * 60;
+  const low = Number(t.low);
+  if (!Number.isFinite(open) || !Number.isFinite(low)) return null;
+  const bar = {
+    time: labelFor(interval, open),
+    open: price(low + Number(t.deltaOpen || 0), digits),
+    high: price(low + Number(t.deltaHigh || 0), digits),
+    low: price(low, digits),
+    close: price(low + Number(t.deltaClose || 0), digits),
+    hasClose: t.deltaClose !== undefined && t.deltaClose !== null,
+    volume: Number(t.volume) || 0, // tick volume, as on TradingView's broker feeds
+    // cTrader does not flag the forming bar, so a bar is closed once its nominal period has elapsed.
+    closeTime: open + INTERVALS[interval].seconds,
+  };
+  bar.closed = bar.closeTime <= nowSec;
+  return bar;
+}
+
 function decode(trendbars, interval, digits, nowSec) {
-  const step = INTERVALS[interval].seconds;
   const bars = [];
   for (const t of trendbars || []) {
-    const open = Number(t.utcTimestampInMinutes) * 60;
-    const low = Number(t.low);
-    if (!Number.isFinite(open) || !Number.isFinite(low)) continue;
-
-    const bar = {
-      time: labelFor(interval, open),
-      open: price(low + Number(t.deltaOpen || 0), digits),
-      high: price(low + Number(t.deltaHigh || 0), digits),
-      low: price(low, digits),
-      close: price(low + Number(t.deltaClose || 0), digits),
-      volume: Number(t.volume) || 0, // tick volume, as on TradingView's broker feeds
-      // cTrader does not flag the forming bar, so a bar is closed once its nominal period has elapsed.
-      closeTime: open + step,
-    };
-    bar.closed = bar.closeTime <= nowSec;
+    const bar = decodeTrendbar(t, interval, digits, nowSec);
+    if (!bar) continue;
+    delete bar.hasClose;
     bars.push(bar);
   }
   bars.sort((a, b) => a.time - b.time);
@@ -130,6 +137,9 @@ function nextBarCloseAt(interval, nowSec) {
 
 module.exports = {
   name: 'ctrader',
+  PERIOD,
+  labelFor,
+  decodeTrendbar,
   maxLimit: MAX_LIMIT,
   ttlFromFormingBar: true,
   fetchCandles,

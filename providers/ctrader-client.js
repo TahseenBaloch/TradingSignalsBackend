@@ -31,8 +31,12 @@ const PT = {
   UNSUBSCRIBE_SPOTS_REQ: 2129,
   UNSUBSCRIBE_SPOTS_RES: 2130,
   SPOT_EVENT: 2131,
+  SUBSCRIBE_LIVE_TRENDBAR_REQ: 2135,
+  UNSUBSCRIBE_LIVE_TRENDBAR_REQ: 2136,
   GET_TRENDBARS_REQ: 2137,
   GET_TRENDBARS_RES: 2138,
+  SUBSCRIBE_LIVE_TRENDBAR_RES: 2165,
+  UNSUBSCRIBE_LIVE_TRENDBAR_RES: 2166,
   OA_ERROR_RES: 2142,
   TOKEN_INVALIDATED_EVENT: 2147,
   CLIENT_DISCONNECT_EVENT: 2148,
@@ -74,6 +78,7 @@ const pending = new Map(); // clientMsgId -> { resolve, reject, timer }
 const spotListeners = new Set();
 const stateListeners = new Set();
 const spotRefs = new Map(); // symbolId -> subscriber count, so a reconnect can resubscribe
+const trendbarRefs = new Map(); // `${symbolId}:${period}` -> subscriber count, likewise
 const historyQueue = [];
 let historyTimer = null;
 let lastHistoryAt = 0;
@@ -292,6 +297,13 @@ async function authenticate() {
   if (ids.length) {
     await sendRequest(PT.SUBSCRIBE_SPOTS_REQ, { ctidTraderAccountId: accountId, symbolId: ids, subscribeToSpotTimestamp: true });
   }
+  // Live trendbars ride on the spot subscription, so they go second. One failing must not fail the whole reconnect.
+  for (const key of trendbarRefs.keys()) {
+    const [symbolId, period] = key.split(':').map(Number);
+    await sendRequest(PT.SUBSCRIBE_LIVE_TRENDBAR_REQ, { ctidTraderAccountId: accountId, symbolId, period }).catch((err) => {
+      if (err.providerCode !== 'ALREADY_SUBSCRIBED') console.warn(`[ctrader] live trendbar ${key} resubscribe failed:`, err.message);
+    });
+  }
 }
 
 async function loadSymbols() {
@@ -485,6 +497,30 @@ async function unsubscribeSpots(symbolId) {
   if (state === 'ready') await request(PT.UNSUBSCRIBE_SPOTS_REQ, { symbolId: [symbolId] }).catch(() => {});
 }
 
+/** The broker's own forming bar for this period, delivered as `trendbar` on the symbol's spot events. Needs the spot subscription first. */
+async function subscribeLiveTrendbar(symbolId, period) {
+  const key = `${symbolId}:${period}`;
+  const count = trendbarRefs.get(key) || 0;
+  trendbarRefs.set(key, count + 1);
+  if (count > 0) return;
+  try {
+    await request(PT.SUBSCRIBE_LIVE_TRENDBAR_REQ, { symbolId, period });
+  } catch (err) {
+    if (err.providerCode !== 'ALREADY_SUBSCRIBED') {
+      trendbarRefs.delete(key);
+      throw err;
+    }
+  }
+}
+
+async function unsubscribeLiveTrendbar(symbolId, period) {
+  const key = `${symbolId}:${period}`;
+  const count = trendbarRefs.get(key) || 0;
+  if (count > 1) return trendbarRefs.set(key, count - 1);
+  trendbarRefs.delete(key);
+  if (state === 'ready') await request(PT.UNSUBSCRIBE_LIVE_TRENDBAR_REQ, { symbolId, period }).catch(() => {});
+}
+
 function onSpot(listener) {
   spotListeners.add(listener);
   return () => spotListeners.delete(listener);
@@ -519,6 +555,8 @@ module.exports = {
   preloadDetails,
   subscribeSpots,
   unsubscribeSpots,
+  subscribeLiveTrendbar,
+  unsubscribeLiveTrendbar,
   onSpot,
   onState,
   close,
