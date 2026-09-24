@@ -2,7 +2,12 @@
 // receive live bars fanned out from the shared upstream provider streams.
 const { WebSocketServer } = require('ws');
 const tickets = require('./tickets');
-const upstream = require('../providers/binance-stream');
+const binanceStreams = require('../providers/binance-stream');
+const oandaStream = require('../providers/oanda-stream');
+const ctraderStream = require('../providers/ctrader-stream');
+
+// Keyed by the symbol registry's `provider`; every source exposes the same subscribe() contract.
+const STREAMS_BY_PROVIDER = { ...binanceStreams.STREAMS_BY_PROVIDER, oanda: oandaStream, ctrader: ctraderStream };
 const { getSymbol } = require('../symbols');
 const { resolveInterval, SUPPORTED } = require('../intervals');
 
@@ -70,11 +75,16 @@ function handleSubscribe(ws, msg) {
   const key = `${symbol.symbol}:${interval}`;
   if (ws.subs.has(key)) return send(ws, { t: 'sub_ok', symbol: symbol.symbol, interval });
 
+  const source = STREAMS_BY_PROVIDER[symbol.provider];
+  if (!source) {
+    return send(ws, { t: 'error', code: 'stream_unsupported', message: `Live data is not available for ${symbol.symbol}` });
+  }
+
   if (ws.subs.size >= MAX_SUBSCRIPTIONS_PER_CLIENT) {
     return send(ws, { t: 'error', code: 'too_many_subscriptions', message: 'Subscription limit reached' });
   }
 
-  const unsubscribe = upstream.subscribe(symbol.providerSymbol, interval, (event, payload) => {
+  const unsubscribe = source.subscribe(symbol.providerSymbol, interval, (event, payload) => {
     // Every message names its symbol and interval so the client can discard
     // bars that arrive after it switched away - otherwise an in-flight BTC bar
     // can paint an ETH candle at a BTC price.
@@ -84,6 +94,8 @@ function handleSubscribe(ws, msg) {
         symbol: symbol.symbol,
         interval,
         closed: payload.closed,
+        // Open time of the bar before this one, from sources whose markets have gaps (undefined is dropped by JSON).
+        prevTime: payload.prevTime ?? undefined,
         bar: {
           time: payload.time,
           open: payload.open,
@@ -205,7 +217,7 @@ function close() {
     wss.close();
     wss = null;
   }
-  upstream.closeAll();
+  for (const source of new Set(Object.values(STREAMS_BY_PROVIDER))) source.closeAll();
 }
 
 module.exports = { attach, close, PATH };

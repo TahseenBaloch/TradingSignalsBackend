@@ -2,13 +2,13 @@
 // what the frontend already uses). `seconds` is the bar duration, used to align
 // cache TTLs to the next bar close.
 const INTERVALS = {
-  '1m': { binance: '1m', seconds: 60 },
-  '5m': { binance: '5m', seconds: 300 },
-  '15m': { binance: '15m', seconds: 900 },
-  '1h': { binance: '1h', seconds: 3600 },
-  '4h': { binance: '4h', seconds: 14400 },
-  '1D': { binance: '1d', seconds: 86400 },
-  '1W': { binance: '1w', seconds: 604800 },
+  '1m': { binance: '1m', oanda: 'M1', seconds: 60 },
+  '5m': { binance: '5m', oanda: 'M5', seconds: 300 },
+  '15m': { binance: '15m', oanda: 'M15', seconds: 900 },
+  '1h': { binance: '1h', oanda: 'H1', seconds: 3600 },
+  '4h': { binance: '4h', oanda: 'H4', seconds: 14400 },
+  '1D': { binance: '1d', oanda: 'D', seconds: 86400 },
+  '1W': { binance: '1w', oanda: 'W', seconds: 604800 },
 };
 
 const DEFAULT_INTERVAL = '1D';

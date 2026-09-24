@@ -8,6 +8,9 @@ const { searchTickers } = require('./symbols');
 const { getChart } = require('./chart-service');
 const { getFlow } = require('./flow-service');
 const stream = require('./stream/server');
+const oanda = require('./providers/oanda');
+const ctraderClient = require('./providers/ctrader-client');
+const { FX_ROWS, FX_PROVIDER } = require('./symbols');
 const tickets = require('./stream/tickets');
 
 const app = express();
@@ -85,6 +88,25 @@ const server = app.listen(port, () => {
 });
 
 stream.attach(server);
+
+// Learn which broker-feed instruments this account can chart (and their precision), so /tickers hides the rest.
+// Until the feed answers, every row is listed.
+if (FX_PROVIDER === 'ctrader' && ctraderClient.configured()) {
+  ctraderClient
+    .preloadDetails(FX_ROWS.map((r) => r.ctrader))
+    .then(() => {
+      const missing = FX_ROWS.filter((r) => !ctraderClient.isListed(r.ctrader)).map((r) => r.symbol);
+      if (missing.length) console.log(`[ctrader] not offered by this account, hidden: ${missing.join(', ')}`);
+    })
+    .catch((err) => console.warn('[ctrader] could not load symbols, listing every row:', err.message));
+} else if (FX_PROVIDER === 'oanda' && oanda.configured()) {
+  oanda
+    .loadInstruments()
+    .then((list) => console.log(`[oanda] ${list.size} instruments available to this account`))
+    .catch((err) => console.warn('[oanda] could not load instruments, listing every OANDA symbol:', err.message));
+} else {
+  console.log('[fx] no cTrader or OANDA credentials; forex, spot metals and index CFDs are hidden');
+}
 
 // Without this every nodemon restart leaks upstream sockets, and Binance caps attempts at 300 per 5 minutes per IP.
 let shuttingDown = false;

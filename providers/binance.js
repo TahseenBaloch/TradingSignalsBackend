@@ -1,13 +1,8 @@
 const { INTERVALS } = require('../intervals');
 const { httpError } = require('../http-error');
 
-const BASE = process.env.BINANCE_BASE_URL || 'https://api.binance.com';
 const TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 8000;
-const MAX_LIMIT = 1000; // Binance's hard cap for /api/v3/klines
-
-// Set when Binance answers 429/418. Hammering through a rate limit escalates to
-// a temporary IP ban, so we fail fast locally until the window passes.
-let circuitOpenUntil = 0;
+const MAX_LIMIT = 1000; // spot's hard cap; futures allows 1500 but costs double weight past 1000 and /chart serves 1000
 
 // Raw kline: [openTimeMs, open, high, low, close, volume, closeTimeMs, ...]
 // Prices and volumes arrive as strings, times as milliseconds.
@@ -46,49 +41,63 @@ function normalize(raw) {
   return bars.filter((b, i) => i === bars.length - 1 || b.time !== bars[i + 1].time);
 }
 
-async function fetchCandles({ providerSymbol, interval, limit = MAX_LIMIT }) {
-  if (Date.now() < circuitOpenUntil) {
-    throw httpError(429, 'rate_limited', 'Market data provider rate limit hit, backing off');
-  }
+// Spot and USDⓈ-M futures share the kline format but not a rate limit, so each instance keeps its own circuit breaker.
+function createKlineProvider({ name, baseUrl, path }) {
+  // Set when Binance answers 429/418. Hammering through a rate limit escalates to
+  // a temporary IP ban, so we fail fast locally until the window passes.
+  let circuitOpenUntil = 0;
 
-  const url = new URL('/api/v3/klines', BASE);
-  url.searchParams.set('symbol', providerSymbol);
-  url.searchParams.set('interval', INTERVALS[interval].binance);
-  url.searchParams.set('limit', String(Math.min(limit, MAX_LIMIT)));
-
-  let res;
-  try {
-    res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
-  } catch (err) {
-    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      throw httpError(504, 'upstream_timeout', 'Market data provider timed out');
+  async function fetchCandles({ providerSymbol, interval, limit = MAX_LIMIT }) {
+    if (Date.now() < circuitOpenUntil) {
+      throw httpError(429, 'rate_limited', 'Market data provider rate limit hit, backing off');
     }
-    throw httpError(502, 'upstream_unreachable', 'Market data provider unreachable');
+
+    const url = new URL(path, baseUrl);
+    url.searchParams.set('symbol', providerSymbol);
+    url.searchParams.set('interval', INTERVALS[interval].binance);
+    url.searchParams.set('limit', String(Math.min(limit, MAX_LIMIT)));
+
+    let res;
+    try {
+      res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    } catch (err) {
+      if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+        throw httpError(504, 'upstream_timeout', 'Market data provider timed out');
+      }
+      throw httpError(502, 'upstream_unreachable', 'Market data provider unreachable');
+    }
+
+    if (res.status === 429 || res.status === 418) {
+      const retryAfter = Number(res.headers.get('retry-after')) || 30;
+      circuitOpenUntil = Date.now() + retryAfter * 1000;
+      throw httpError(429, 'rate_limited', 'Market data provider rate limit hit');
+    }
+
+    if (!res.ok) {
+      // Binance errors look like { code: -1121, msg: 'Invalid symbol.' }. A bad
+      // symbol here means our own providerSymbol mapping is wrong, which is a
+      // server-side bug, not client input error - hence 502 rather than 400.
+      const body = await res.json().catch(() => null);
+      const detail = body && body.msg ? `: ${body.msg}` : '';
+      throw httpError(502, 'upstream_error', `Market data provider rejected the request${detail}`, {
+        providerCode: body && body.code,
+      });
+    }
+
+    const raw = await res.json().catch(() => null);
+    if (!Array.isArray(raw)) {
+      throw httpError(502, 'upstream_bad_payload', 'Unexpected response from market data provider');
+    }
+
+    return { bars: normalize(raw), fetchedAt: Math.floor(Date.now() / 1000) };
   }
 
-  if (res.status === 429 || res.status === 418) {
-    const retryAfter = Number(res.headers.get('retry-after')) || 30;
-    circuitOpenUntil = Date.now() + retryAfter * 1000;
-    throw httpError(429, 'rate_limited', 'Market data provider rate limit hit');
-  }
-
-  if (!res.ok) {
-    // Binance errors look like { code: -1121, msg: 'Invalid symbol.' }. A bad
-    // symbol here means our own providerSymbol mapping is wrong, which is a
-    // server-side bug, not client input error - hence 502 rather than 400.
-    const body = await res.json().catch(() => null);
-    const detail = body && body.msg ? `: ${body.msg}` : '';
-    throw httpError(502, 'upstream_error', `Market data provider rejected the request${detail}`, {
-      providerCode: body && body.code,
-    });
-  }
-
-  const raw = await res.json().catch(() => null);
-  if (!Array.isArray(raw)) {
-    throw httpError(502, 'upstream_bad_payload', 'Unexpected response from market data provider');
-  }
-
-  return { bars: normalize(raw), fetchedAt: Math.floor(Date.now() / 1000) };
+  return { name, maxLimit: MAX_LIMIT, fetchCandles };
 }
 
-module.exports = { name: 'binance', maxLimit: MAX_LIMIT, fetchCandles };
+module.exports = createKlineProvider({
+  name: 'binance',
+  baseUrl: process.env.BINANCE_BASE_URL || 'https://api.binance.com',
+  path: '/api/v3/klines',
+});
+module.exports.createKlineProvider = createKlineProvider;
