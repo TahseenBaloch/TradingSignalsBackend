@@ -2,7 +2,7 @@ const cache = require('./cache');
 const { getSymbol } = require('./symbols');
 const { INTERVALS, resolveInterval, SUPPORTED } = require('./intervals');
 const { httpError } = require('./http-error');
-const { fetchAggTrades } = require('./providers/binance-trades');
+const { TRADES_BY_PROVIDER } = require('./providers/binance-trades');
 
 // Per-bar order flow from aggTrades: a kline knows a bar's total volume but not which side crossed the spread, so delta and imbalance are invisible from OHLCV.
 
@@ -131,7 +131,8 @@ async function getFlow({ symbol: symbolInput, interval: intervalInput, bars: bar
   if (!symbol) {
     throw httpError(400, 'unknown_symbol', `Unknown symbol: ${symbolInput}`);
   }
-  if (symbol.provider !== 'binance') {
+  const tape = TRADES_BY_PROVIDER[symbol.provider];
+  if (!tape) {
     throw httpError(400, 'flow_unsupported', `Order flow is not available for ${symbol.symbol}`);
   }
 
@@ -156,12 +157,13 @@ async function getFlow({ symbol: symbolInput, interval: intervalInput, bars: bar
 
   const jobs = opens.map((open) => async () => {
     const closed = open + step <= nowSec;
-    const key = `flow:${CACHE_VERSION}:${symbol.providerSymbol}:${interval}:${open}:${requestedBucket ?? 'auto'}`;
+    // Provider is in the key because spot and futures share symbols like BTCUSDT but not a tape.
+    const key = `flow:${CACHE_VERSION}:${symbol.provider}:${symbol.providerSymbol}:${interval}:${open}:${requestedBucket ?? 'auto'}`;
 
     const hit = await cache.get(key);
     if (hit) return hit;
 
-    const { trades, truncated } = await fetchAggTrades({
+    const { trades, truncated } = await tape.fetchAggTrades({
       providerSymbol: symbol.providerSymbol,
       startMs: open * 1000,
       endMs: (open + step) * 1000 - 1,
@@ -189,7 +191,7 @@ async function getFlow({ symbol: symbolInput, interval: intervalInput, bars: bar
     interval,
     bars: built,
     meta: {
-      provider: 'binance-trades',
+      provider: tape.name,
       count: built.length,
       bucket: requestedBucket ?? (built.find((b) => b.bucket)?.bucket ?? null),
       truncatedBars: built.filter((b) => b.truncated).length,

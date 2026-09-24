@@ -8,8 +8,6 @@
 const WebSocket = require('ws');
 const { INTERVALS } = require('../intervals');
 
-const BASE = process.env.BINANCE_STREAM_URL || 'wss://stream.binance.com:9443/ws';
-
 // Keep an unsubscribed stream open briefly. Flipping 1m -> 5m -> 1m, or a React
 // StrictMode remount, would otherwise pay a full reconnect each time.
 const IDLE_LINGER_MS = 30_000;
@@ -27,254 +25,295 @@ const DEGRADED_AFTER_RETRIES = 10;
 
 // Binance allows 300 connection attempts per 5 minutes per IP. Leaked sockets
 // from repeated restarts can reach that during a day of development, so every
-// connect goes through a shared budget.
+// connect goes through a shared budget (one per host, since spot and futures count separately).
 const CONNECT_BUDGET = 5;
 const CONNECT_WINDOW_MS = 10_000;
-let connectTimes = [];
 
-const streams = new Map(); // `${providerSymbol}:${binanceInterval}` -> entry
+// Spot and USDⓈ-M futures send the same kline event; only the host differs, so each gets its own instance with its own sockets and budget.
+// `pingsProveLive` is for hosts whose markets can be silent for minutes: there a ping frame, not a kline, is the only sign of life.
+function createKlineStream({ name, baseUrl, stallTimeoutMs = STALL_TIMEOUT_MS, pingsProveLive = false }) {
+  let connectTimes = [];
 
-function canConnectNow() {
-  const cutoff = Date.now() - CONNECT_WINDOW_MS;
-  connectTimes = connectTimes.filter((t) => t > cutoff);
-  return connectTimes.length < CONNECT_BUDGET;
-}
+  const streams = new Map(); // `${providerSymbol}:${binanceInterval}` -> entry
 
-function normalize(k) {
-  return {
-    // k.t is the bar's OPEN time. Using k.T (close) would shift every bar by a
-    // full period. Milliseconds -> seconds, matching the REST provider.
-    time: Math.floor(Number(k.t) / 1000),
-    open: Number(k.o),
-    high: Number(k.h),
-    low: Number(k.l),
-    close: Number(k.c),
-    // k.v is base-asset volume, the same field providers/binance.js uses. k.q
-    // is quote volume; mixing them makes the volume bar jump on every refetch.
-    volume: Number(k.v),
-    closed: k.x === true,
-  };
-}
+  function canConnectNow() {
+    const cutoff = Date.now() - CONNECT_WINDOW_MS;
+    connectTimes = connectTimes.filter((t) => t > cutoff);
+    return connectTimes.length < CONNECT_BUDGET;
+  }
 
-function emit(entry, event, payload) {
-  for (const listener of entry.listeners) {
-    try {
-      listener(event, payload);
-    } catch (err) {
-      console.error('[stream] listener threw:', err.message);
+  function normalize(k) {
+    return {
+      // k.t is the bar's OPEN time. Using k.T (close) would shift every bar by a
+      // full period. Milliseconds -> seconds, matching the REST provider.
+      time: Math.floor(Number(k.t) / 1000),
+      open: Number(k.o),
+      high: Number(k.h),
+      low: Number(k.l),
+      close: Number(k.c),
+      // k.v is base-asset volume, the same field providers/binance.js uses. k.q
+      // is quote volume; mixing them makes the volume bar jump on every refetch.
+      volume: Number(k.v),
+      closed: k.x === true,
+    };
+  }
+
+  function emit(entry, event, payload) {
+    for (const listener of entry.listeners) {
+      try {
+        listener(event, payload);
+      } catch (err) {
+        console.error('[stream] listener threw:', err.message);
+      }
     }
   }
-}
 
-function setState(entry, state) {
-  if (entry.state === state) return;
-  entry.state = state;
-  emit(entry, 'status', { state });
-}
+  function setState(entry, state) {
+    if (entry.state === state) return;
+    entry.state = state;
+    emit(entry, 'status', { state });
+  }
 
-function clearTimers(entry) {
-  clearTimeout(entry.reconnectTimer);
-  clearTimeout(entry.rotateTimer);
-  clearInterval(entry.stallTimer);
-  entry.reconnectTimer = null;
-  entry.rotateTimer = null;
-  entry.stallTimer = null;
-}
-
-function scheduleReconnect(entry) {
-  if (entry.closing || entry.reconnectTimer) return;
-
-  const delay =
-    Math.min(RECONNECT_BASE_MS * 2 ** entry.retries, RECONNECT_MAX_MS) +
-    Math.floor(Math.random() * 1000);
-  entry.retries += 1;
-
-  if (entry.retries >= DEGRADED_AFTER_RETRIES) setState(entry, 'degraded');
-
-  entry.reconnectTimer = setTimeout(() => {
+  function clearTimers(entry) {
+    clearTimeout(entry.reconnectTimer);
+    clearTimeout(entry.rotateTimer);
+    clearInterval(entry.stallTimer);
     entry.reconnectTimer = null;
-    connect(entry);
-  }, delay);
-}
+    entry.rotateTimer = null;
+    entry.stallTimer = null;
+  }
 
-function connect(entry) {
-  if (entry.closing) return;
+  function scheduleReconnect(entry) {
+    if (entry.closing || entry.reconnectTimer) return;
 
-  if (!canConnectNow()) {
+    const delay =
+      Math.min(RECONNECT_BASE_MS * 2 ** entry.retries, RECONNECT_MAX_MS) +
+      Math.floor(Math.random() * 1000);
+    entry.retries += 1;
+
+    if (entry.retries >= DEGRADED_AFTER_RETRIES) setState(entry, 'degraded');
+
     entry.reconnectTimer = setTimeout(() => {
       entry.reconnectTimer = null;
       connect(entry);
-    }, CONNECT_WINDOW_MS / CONNECT_BUDGET);
-    return;
+    }, delay);
   }
-  connectTimes.push(Date.now());
 
-  if (entry.state !== 'degraded') setState(entry, 'connecting');
+  function connect(entry) {
+    if (entry.closing) return;
 
-  const url = `${BASE}/${entry.providerSymbol.toLowerCase()}@kline_${entry.binanceInterval}`;
-  const ws = new WebSocket(url);
-  entry.ws = ws;
-  entry.lastMessageAt = Date.now();
-
-  // Mandatory: an unhandled 'error' event on an EventEmitter terminates the
-  // process. Same hazard cache.js documents for Redis.
-  ws.on('error', (err) => {
-    console.warn(`[stream] ${entry.key} socket error:`, err.message);
-  });
-
-  ws.on('message', (raw) => {
-    entry.lastMessageAt = Date.now();
-
-    // Reset backoff on real data, not on 'open'. Binance can accept a
-    // connection and then never send anything.
-    entry.retries = 0;
-    setState(entry, 'live');
-
-    // A rotation replacement proves itself by delivering data; only then do we
-    // retire the old socket, so there is no visible gap.
-    if (entry.previousWs) {
-      const old = entry.previousWs;
-      entry.previousWs = null;
-      old.removeAllListeners();
-      old.close();
-    }
-
-    let msg;
-    try {
-      msg = JSON.parse(raw);
-    } catch {
+    if (!canConnectNow()) {
+      entry.reconnectTimer = setTimeout(() => {
+        entry.reconnectTimer = null;
+        connect(entry);
+      }, CONNECT_WINDOW_MS / CONNECT_BUDGET);
       return;
     }
-    if (!msg || msg.e !== 'kline' || !msg.k) return;
+    connectTimes.push(Date.now());
 
-    const bar = normalize(msg.k);
-    if (!Number.isFinite(bar.time) || !Number.isFinite(bar.close)) return;
+    if (entry.state !== 'degraded') setState(entry, 'connecting');
 
-    entry.lastBar = bar;
-    emit(entry, 'bar', bar);
-  });
+    const url = `${baseUrl}/${entry.providerSymbol.toLowerCase()}@kline_${entry.binanceInterval}`;
+    const ws = new WebSocket(url);
+    entry.ws = ws;
+    entry.lastMessageAt = Date.now();
 
-  ws.on('close', () => {
-    if (entry.closing || entry.ws !== ws) return; // superseded by a rotation
-    setState(entry, 'connecting');
-    scheduleReconnect(entry);
-  });
+    // Mandatory: an unhandled 'error' event on an EventEmitter terminates the
+    // process. Same hazard cache.js documents for Redis.
+    ws.on('error', (err) => {
+      console.warn(`[stream:${name}] ${entry.key} socket error:`, err.message);
+    });
 
-  clearInterval(entry.stallTimer);
-  entry.stallTimer = setInterval(() => {
-    if (Date.now() - entry.lastMessageAt <= STALL_TIMEOUT_MS) return;
-    console.warn(`[stream] ${entry.key} stalled, terminating`);
-    // terminate() not close(): a graceful close waits for a handshake that a
-    // half-open socket will never complete.
-    ws.terminate();
-  }, STALL_TIMEOUT_MS / 3);
+    // Klines only arrive on trades. Once a socket has delivered one, pings count as liveness; before that only on hosts that opt in.
+    let delivered = false;
+    ws.on('ping', () => {
+      if (!delivered && !pingsProveLive) return;
+      entry.lastMessageAt = Date.now();
+      if (pingsProveLive) {
+        entry.retries = 0;
+        setState(entry, 'live');
+      }
+    });
 
-  clearTimeout(entry.rotateTimer);
-  entry.rotateTimer = setTimeout(() => rotate(entry), ROTATE_AFTER_MS);
-}
+    ws.on('message', (raw) => {
+      delivered = true;
+      entry.lastMessageAt = Date.now();
 
-// Open a replacement ahead of Binance's 24h forced close. The old socket keeps
-// serving until the new one delivers its first message (see 'message' above).
-function rotate(entry) {
-  if (entry.closing || !entry.ws) return;
-  console.log(`[stream] ${entry.key} rotating connection`);
-  entry.previousWs = entry.ws;
-  entry.previousWs.removeAllListeners('close');
-  entry.previousWs.on('close', () => {});
-  connect(entry);
-}
+      // Reset backoff on real data, not on 'open'. Binance can accept a
+      // connection and then never send anything.
+      entry.retries = 0;
+      setState(entry, 'live');
 
-function destroy(entry) {
-  entry.closing = true;
-  clearTimers(entry);
-  if (entry.previousWs) {
-    entry.previousWs.removeAllListeners();
-    entry.previousWs.terminate();
-    entry.previousWs = null;
+      // A rotation replacement proves itself by delivering data; only then do we
+      // retire the old socket, so there is no visible gap.
+      if (entry.previousWs) {
+        const old = entry.previousWs;
+        entry.previousWs = null;
+        old.removeAllListeners();
+        old.close();
+      }
+
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!msg || msg.e !== 'kline' || !msg.k) return;
+
+      const bar = normalize(msg.k);
+      if (!Number.isFinite(bar.time) || !Number.isFinite(bar.close)) return;
+
+      entry.lastBar = bar;
+      emit(entry, 'bar', bar);
+    });
+
+    ws.on('close', () => {
+      if (entry.closing || entry.ws !== ws) return; // superseded by a rotation
+      setState(entry, 'connecting');
+      scheduleReconnect(entry);
+    });
+
+    clearInterval(entry.stallTimer);
+    entry.stallTimer = setInterval(() => {
+      if (Date.now() - entry.lastMessageAt <= stallTimeoutMs) return;
+      console.warn(`[stream:${name}] ${entry.key} stalled, terminating`);
+      // terminate() not close(): a graceful close waits for a handshake that a
+      // half-open socket will never complete.
+      ws.terminate();
+    }, stallTimeoutMs / 3);
+
+    clearTimeout(entry.rotateTimer);
+    entry.rotateTimer = setTimeout(() => rotate(entry), ROTATE_AFTER_MS);
   }
-  if (entry.ws) {
-    entry.ws.removeAllListeners();
-    entry.ws.terminate();
-    entry.ws = null;
-  }
-  streams.delete(entry.key);
-}
 
-/**
- * Subscribe to live bars for one symbol+interval.
- *
- * @param providerSymbol upstream symbol, e.g. 'BTCUSDT'
- * @param interval       our interval token, e.g. '1m' (see intervals.js)
- * @param listener       (event, payload) => void, event is 'bar' | 'status'
- * @param opts.keepAlive keep the upstream open with zero subscribers - for
- *                       server-side consumers that must not miss data
- * @returns unsubscribe function
- */
-function subscribe(providerSymbol, interval, listener, opts = {}) {
-  const spec = INTERVALS[interval];
-  if (!spec) throw new Error(`Unsupported interval: ${interval}`);
-
-  const key = `${providerSymbol}:${spec.binance}`;
-  let entry = streams.get(key);
-
-  if (!entry) {
-    entry = {
-      key,
-      providerSymbol,
-      binanceInterval: spec.binance,
-      ws: null,
-      previousWs: null,
-      listeners: new Set(),
-      lastBar: null,
-      lastMessageAt: 0,
-      retries: 0,
-      state: 'connecting',
-      closing: false,
-      keepAlive: false,
-      reconnectTimer: null,
-      rotateTimer: null,
-      stallTimer: null,
-      idleTimer: null,
-    };
-    streams.set(key, entry);
+  // Open a replacement ahead of Binance's 24h forced close. The old socket keeps
+  // serving until the new one delivers its first message (see 'message' above).
+  function rotate(entry) {
+    if (entry.closing || !entry.ws) return;
+    console.log(`[stream:${name}] ${entry.key} rotating connection`);
+    entry.previousWs = entry.ws;
+    entry.previousWs.removeAllListeners('close');
+    entry.previousWs.on('close', () => {});
     connect(entry);
   }
 
-  if (opts.keepAlive) entry.keepAlive = true;
+  function destroy(entry) {
+    entry.closing = true;
+    clearTimers(entry);
+    if (entry.previousWs) {
+      entry.previousWs.removeAllListeners();
+      entry.previousWs.terminate();
+      entry.previousWs = null;
+    }
+    if (entry.ws) {
+      entry.ws.removeAllListeners();
+      entry.ws.terminate();
+      entry.ws = null;
+    }
+    streams.delete(entry.key);
+  }
 
-  clearTimeout(entry.idleTimer);
-  entry.idleTimer = null;
-  entry.listeners.add(listener);
+  /**
+   * Subscribe to live bars for one symbol+interval.
+   *
+   * @param providerSymbol upstream symbol, e.g. 'BTCUSDT'
+   * @param interval       our interval token, e.g. '1m' (see intervals.js)
+   * @param listener       (event, payload) => void, event is 'bar' | 'status'
+   * @param opts.keepAlive keep the upstream open with zero subscribers - for
+   *                       server-side consumers that must not miss data
+   * @returns unsubscribe function
+   */
+  function subscribe(providerSymbol, interval, listener, opts = {}) {
+    const spec = INTERVALS[interval];
+    if (!spec) throw new Error(`Unsupported interval: ${interval}`);
 
-  // Hand over the current state and last known bar immediately, so a new
-  // subscriber on a warm stream renders at once instead of waiting for a tick.
-  listener('status', { state: entry.state });
-  if (entry.lastBar) listener('bar', entry.lastBar);
+    const key = `${providerSymbol}:${spec.binance}`;
+    let entry = streams.get(key);
 
-  let released = false;
-  return function unsubscribe() {
-    if (released) return;
-    released = true;
-    entry.listeners.delete(listener);
+    if (!entry) {
+      entry = {
+        key,
+        providerSymbol,
+        binanceInterval: spec.binance,
+        ws: null,
+        previousWs: null,
+        listeners: new Set(),
+        lastBar: null,
+        lastMessageAt: 0,
+        retries: 0,
+        state: 'connecting',
+        closing: false,
+        keepAlive: false,
+        reconnectTimer: null,
+        rotateTimer: null,
+        stallTimer: null,
+        idleTimer: null,
+      };
+      streams.set(key, entry);
+      connect(entry);
+    }
 
-    if (entry.listeners.size > 0 || entry.keepAlive) return;
-    entry.idleTimer = setTimeout(() => {
-      if (entry.listeners.size === 0 && !entry.keepAlive) destroy(entry);
-    }, IDLE_LINGER_MS);
-  };
+    if (opts.keepAlive) entry.keepAlive = true;
+
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+    entry.listeners.add(listener);
+
+    // Hand over the current state and last known bar immediately, so a new
+    // subscriber on a warm stream renders at once instead of waiting for a tick.
+    listener('status', { state: entry.state });
+    if (entry.lastBar) listener('bar', entry.lastBar);
+
+    let released = false;
+    return function unsubscribe() {
+      if (released) return;
+      released = true;
+      entry.listeners.delete(listener);
+
+      if (entry.listeners.size > 0 || entry.keepAlive) return;
+      entry.idleTimer = setTimeout(() => {
+        if (entry.listeners.size === 0 && !entry.keepAlive) destroy(entry);
+      }, IDLE_LINGER_MS);
+    };
+  }
+
+  function closeAll() {
+    for (const entry of [...streams.values()]) destroy(entry);
+  }
+
+  function stats() {
+    return [...streams.values()].map((e) => ({
+      key: e.key,
+      state: e.state,
+      listeners: e.listeners.size,
+      lastBarTime: e.lastBar ? e.lastBar.time : null,
+    }));
+  }
+
+  return { name, subscribe, closeAll, stats };
 }
+
+const spot = createKlineStream({
+  name: 'binance',
+  baseUrl: process.env.BINANCE_STREAM_URL || 'wss://stream.binance.com:9443/ws',
+});
+
+// Futures market streams moved under /market/ws; the legacy /ws path still accepts the handshake but never delivers a kline.
+// Thin TradFi perps (and all of them on weekends) can go 7+ minutes without a kline while Binance pings every ~3 minutes, so a
+// 90s stall timer would reconnect a healthy socket in a loop. 2.5 ping intervals tolerates one lost ping.
+const futures = createKlineStream({
+  name: 'binance-futures',
+  baseUrl: process.env.BINANCE_FUTURES_STREAM_URL || 'wss://fstream.binance.com/market/ws',
+  stallTimeoutMs: 450_000,
+  pingsProveLive: true,
+});
+
+// Keyed by the symbol registry's `provider`.
+const STREAMS_BY_PROVIDER = { binance: spot, 'binance-futures': futures };
 
 function closeAll() {
-  for (const entry of [...streams.values()]) destroy(entry);
+  for (const stream of Object.values(STREAMS_BY_PROVIDER)) stream.closeAll();
 }
 
-function stats() {
-  return [...streams.values()].map((e) => ({
-    key: e.key,
-    state: e.state,
-    listeners: e.listeners.size,
-    lastBarTime: e.lastBar ? e.lastBar.time : null,
-  }));
-}
-
-module.exports = { subscribe, closeAll, stats };
+module.exports = { ...spot, closeAll, STREAMS_BY_PROVIDER };

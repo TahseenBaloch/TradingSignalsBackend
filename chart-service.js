@@ -7,7 +7,15 @@ const { httpError } = require('./http-error');
 // resolves to.
 const PROVIDERS = {
   binance: require('./providers/binance'),
+  'binance-futures': require('./providers/binance-futures'),
+  oanda: require('./providers/oanda'),
+  ctrader: require('./providers/ctrader'),
 };
+
+// Providers whose bars are not on the UTC grid (OANDA's New York sessions) say when their bars close.
+function barCloseAt(provider, interval, nowSec) {
+  return provider.nextBarCloseAt ? provider.nextBarCloseAt(interval, nowSec) : nextBarCloseAt(interval, nowSec);
+}
 
 const CACHE_VERSION = 'v2'; // bump to invalidate every entry after a shape change
 const MIN_LIMIT = 10;
@@ -29,8 +37,8 @@ function dedupe(key, fn) {
 
 // Expire exactly when the next bar closes: never sooner (wasted fetch), never
 // later (stale data). Small jitter avoids a thundering herd across symbols.
-function ttlFor(interval, nowSec) {
-  const secondsLeft = nextBarCloseAt(interval, nowSec) - nowSec;
+function ttlFor(provider, interval, nowSec) {
+  const secondsLeft = barCloseAt(provider, interval, nowSec) - nowSec;
   return Math.max(5, secondsLeft + Math.floor(Math.random() * 3));
 }
 
@@ -78,16 +86,22 @@ async function loadClosedBars(key, symbol, interval) {
   // partial close as if it were final - drop it and let the Phase 2 WebSocket
   // own the live bar. Filtering on closeTime is safer than popping the tail.
   const nowSec = Math.floor(Date.now() / 1000);
+  // A provider that knows whether a bar is final (OANDA's `complete`) says so in `closed`; otherwise go by closeTime.
   const closed = bars
-    .filter((b) => b.closeTime < nowSec)
-    .map(({ closeTime, ...bar }) => bar);
+    .filter((b) => (typeof b.closed === 'boolean' ? b.closed : b.closeTime < nowSec))
+    .map(({ closeTime, closed: _closed, ...bar }) => bar);
 
   if (!closed.length) {
     throw httpError(502, 'empty_series', 'Market data provider returned no closed bars');
   }
 
+  // A provider that cannot predict its bar boundaries (a cTrader broker's session clock) marks the forming bar's close,
+  // and the cache expires exactly then.
+  const forming = provider.ttlFromFormingBar ? bars.find((b) => b.closed === false && Number.isFinite(b.closeTime)) : null;
+  const ttl = forming ? Math.max(5, forming.closeTime - nowSec + Math.floor(Math.random() * 3)) : ttlFor(provider, interval, nowSec);
+
   const encoded = encodeBars(closed);
-  await cache.set(key, encoded, ttlFor(interval, nowSec));
+  await cache.set(key, encoded, ttl);
   await cache.setStale(key, encoded);
   return closed;
 }
@@ -144,7 +158,7 @@ async function getChart({ symbol: symbolInput, interval: intervalInput, limit: l
       // Every bar returned is closed; the one still forming arrives at
       // nextBarAvailableAt, which is also when this cache entry expires.
       lastBarClosed: true,
-      nextBarAvailableAt: nextBarCloseAt(interval, Math.floor(Date.now() / 1000)),
+      nextBarAvailableAt: barCloseAt(PROVIDERS[symbol.provider], interval, Math.floor(Date.now() / 1000)),
       cached,
       cacheBackend: cache.backend(),
       stale,

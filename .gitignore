@@ -2,3 +2,6 @@ node_modules
 .env
 .env.local
 npm-debug.log*
+
+# Rotated cTrader OAuth tokens, written by providers/ctrader-client.js
+.ctrader-tokens.json
